@@ -146,132 +146,25 @@ function appendMessage(role, html) {
 
 function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
-// --- Sandbox: run JS safely in an iframe ---
-async function runJsInSandbox(code){
-  return new Promise((resolve) => {
-    const iframe = document.getElementById('sandbox');
-    const blob = new Blob([
-      `<!doctype html><script>\n`+
-      `let logs=[];\n`+
-      `const origLog = console.log; console.log = (...a)=>{logs.push(a.map(x=>typeof x==='object'?JSON.stringify(x):String(x)).join(' ')); origLog(...a)};\n`+
-      `window.addEventListener('message', async (e)=>{\n`+
-      `  try { let result = await (async()=>{ ${code} })();\n`+
-      `    parent.postMessage({type:'sandboxResult', ok:true, logs, result: String(result)}, '*'); }\n`+
-      `  catch(err){ parent.postMessage({type:'sandboxResult', ok:false, logs, error: String(err)}, '*'); }\n`+
-      `});<\/script>`
-    ], {type:'text/html'});
-    const url = URL.createObjectURL(blob);
-    iframe.src = url;
-    const handler = (e)=>{
-      if(e.data && e.data.type==='sandboxResult'){
-        window.removeEventListener('message', handler);
-        URL.revokeObjectURL(url);
-        resolve(e.data);
-      }
-    };
-    window.addEventListener('message', handler);
-    setTimeout(()=>iframe.contentWindow.postMessage({run:true}, '*'), 50);
-  });
-}
-
-// --- Tool executors (called by the agent loop) ---
-async function tool_google_search(args){
-  const { query, num=5 } = args||{};
-  const key = el('#gKey').value.trim();
-  const cx  = el('#gCx').value.trim();
-  if(!key || !cx) throw new Error('Google API key & CX required');
-  const url = new URL('https://www.googleapis.com/customsearch/v1');
-  url.searchParams.set('key', key);
-  url.searchParams.set('cx', cx);
-  url.searchParams.set('q', query);
-  url.searchParams.set('num', Math.min(num, 10));
-  const res = await fetch(url);
-  if(!res.ok) throw new Error('Google CSE error: '+res.status);
-  const data = await res.json();
-  const items = (data.items||[]).map(x=>({title:x.title, link:x.link, snippet:x.snippet}));
-  return {query, items};
-}
-
-async function tool_ai_pipe_api(args){
-  const { path='/chat/completions', body={} } = args||{};
-  const base = el('#baseUrl').value.trim().replace(/\/$/, '');
-  const key  = el('#apiKey').value.trim();
-  const url = base + path;
-  const res = await fetch(url, { method:'POST', headers: { 'Content-Type':'application/json', 'Authorization': key?`Bearer ${key}`:undefined }, body: JSON.stringify(body) });
-  const txt = await res.text();
-  if(!res.ok){ throw new Error(`AI Pipe tool error ${res.status}: ${txt.slice(0,300)}`); }
-  try { return JSON.parse(txt); } catch { return { raw: txt }; }
-}
-
-async function tool_run_js(args){
-  const { code } = args||{};
-  const out = await runJsInSandbox(code||'');
-  if(out.ok){ return { logs: out.logs, result: out.result }; }
-  else { throw new Error('JS Error: '+out.error+ (out.logs?.length? ('\nLogs: '+out.logs.join('\n')):'')); }
-}
-
-const TOOL_EXECUTORS = {
-  google_search: tool_google_search,
-  ai_pipe_api: tool_ai_pipe_api,
-  run_js: tool_run_js,
-};
-
-// --- OpenAI-style tool schema sent to the model ---
-function toolSchema(){
-  return [
-    {
-      type: 'function',
-      function: {
-        name: 'google_search',
-        description: 'Search the web and return top snippets for a query',
-        parameters: {
-          type: 'object',
-          properties: { query:{type:'string'}, num:{type:'integer', minimum:1, maximum:10} },
-          required: ['query']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'ai_pipe_api',
-        description: 'POST arbitrary JSON to AI Pipe compatible endpoints (baseUrl + path) and return the JSON/text result',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: {type:'string', description:'/chat/completions or any relative path'},
-            body: {type:'object'}
-          },
-          required: ['path','body']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'run_js',
-        description: 'Securely execute short JavaScript in a sandboxed iframe and return result + console logs',
-        parameters: {
-          type: 'object',
-          properties: { code: {type:'string'} },
-          required: ['code']
-        }
-      }
-    }
-  ];
-}
-
-// --- LLM call ---
+// --- LLM call via backend ---
 async function callLLM(messages){
-  const base = el('#baseUrl').value.trim().replace(/\/$/, '');
-  const key  = el('#apiKey').value.trim();
-  const model = el('#model').value.trim();
-  const url = base + '/chat/completions';
-  const body = { model, messages, tools: toolSchema(), tool_choice: 'auto', temperature: 0.6 };
-  const res = await fetch(url, { method:'POST', headers: { 'Content-Type':'application/json', 'Authorization': key?`Bearer ${key}`:undefined }, body: JSON.stringify(body) });
-  const json = await res.json().catch(async()=>({error: await res.text()}));
-  if(!res.ok) throw new Error('LLM error '+res.status+': '+JSON.stringify(json));
-  return json;
+  try {
+    const res = await fetch("http://127.0.0.1:8000/chat", {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({ message: messages[messages.length - 1].content })
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Backend error ${res.status}: ${text}`);
+    }
+
+    return await res.json();
+  } catch (err) {
+    showAlert("⚠️ Failed to reach backend: " + err.message);
+    throw err;
+  }
 }
 
 // --- Agent loop ---
@@ -284,43 +177,12 @@ function buildInitialMessages(){
   return msgs;
 }
 
-async function handleToolCall(tc){
-  const name = tc.function.name;
-  let args = {};
-  try { args = JSON.parse(tc.function.arguments || '{}'); }
-  catch { args = {}; }
-  appendMessage('tool', `<div><div><code>${escapeHtml(name)}</code> args:</div><pre class="smallcode">${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`);
-  try{
-    const result = await TOOL_EXECUTORS[name](args);
-    appendMessage('tool', `<div>✅ <code>${escapeHtml(name)}</code> result:<pre class="smallcode">${escapeHtml(JSON.stringify(result, null, 2)).slice(0,4000)}</pre></div>`);
-    return { role:'tool', tool_call_id: tc.id, name, content: JSON.stringify(result) };
-  }catch(err){
-    const e = String(err);
-    showAlert(e, 'warning');
-    appendMessage('tool', `<div>❌ <code>${escapeHtml(name)}</code> error:<pre class="smallcode">${escapeHtml(e)}</pre></div>`);
-    return { role:'tool', tool_call_id: tc.id, name, content: JSON.stringify({error: e}) };
-  }
-}
-
 async function agentStep(){
   try{
     const resp = await callLLM(MESSAGES);
-    const choice = resp.choices?.[0];
-    const msg = choice?.message;
-    const text = msg?.content || '';
+    const text = resp.reply || resp.output || JSON.stringify(resp);
     if(text) appendMessage('agent', `<pre>${escapeHtml(text)}</pre>`);
-
-    const toolCalls = msg?.tool_calls || [];
-    if(toolCalls.length){
-      // execute tools (can be parallel, but keep simple)
-      const toolMsgs = [];
-      for(const tc of toolCalls){ toolMsgs.push(await handleToolCall(tc)); }
-      MESSAGES.push(msg, ...toolMsgs);
-      await agentStep(); // continue the loop until no more tool calls
-    } else {
-      // wait for next user input
-      MESSAGES.push(msg);
-    }
+    MESSAGES.push({role:'assistant', content:text});
   } catch(err){
     showAlert(String(err));
   }
@@ -330,7 +192,7 @@ async function agentStep(){
 function resetConversation(){
   log.innerHTML = '';
   MESSAGES = buildInitialMessages();
-  appendMessage('agent', '👋 Ready. Tools: <code>google_search</code>, <code>ai_pipe_api</code>, <code>run_js</code>.');
+  appendMessage('agent', '👋 Ready. Talking through backend at <code>/chat</code>.');
 }
 
 el('#sendBtn').addEventListener('click', async ()=>{
@@ -345,7 +207,6 @@ el('#sendBtn').addEventListener('click', async ()=>{
 
 el('#resetBtn').addEventListener('click', resetConversation);
 
-// Enter key handler
 el('#userInput').addEventListener('keydown', (e)=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); el('#sendBtn').click(); }
 });
