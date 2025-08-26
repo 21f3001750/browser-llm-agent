@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import httpx, os
 
 app = FastAPI()
 
-# Allow your frontend origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # your frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,3 +33,8 @@ async def chat(req: Request):
         response.raise_for_status()
         data = response.json()
         return {"reply": data["choices"][0]["message"]["content"]}
+
+# 👇 Serve frontend
+@app.get("/")
+async def serve_index():
+    return FileResponse("static/index.html")
