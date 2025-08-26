@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM Agent POC – Browser Multi‑Tool</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #0b1220; color: #e9eef7; }
+    .card { background: #0f172a; border: 1px solid #1e293b; }
+    .form-control, .form-select { background:#0b1220; color:#e9eef7; border:1px solid #253047; }
+    .form-control:focus, .form-select:focus { box-shadow:none; border-color:#475569; }
+    .btn-primary { background:#2563eb; border-color:#2563eb; }
+    .btn-outline-light { border-color:#334155; }
+    .message.agent { background:#111827; color:#e9eef7; }
+    .message.user { background:#0b1220; color:#e9eef7; }
+    .message.tool { background:#0b2a1a; color:#e9eef7; }
+    pre { white-space: pre-wrap; word-wrap: break-word; }
+    code { color:#93c5fd; }
+    .smallcode { font-size: 0.85rem; }
+    .sticky-footer { position: sticky; bottom: 0; background: #0b1220; padding: .5rem; z-index: 5; }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <div class="d-flex align-items-center mb-3">
+    <h1 class="h4 me-3">LLM Agent POC</h1>
+    <span class="badge text-bg-secondary">Browser‑based · Tool‑calling · Minimal</span>
+  </div>
+
+  <div id="alerts" class="mb-3"></div>
+
+  <div class="row g-3">
+    <div class="col-12 col-lg-4">
+      <div class="card p-3 mb-3">
+        <h2 class="h6">Model Picker</h2>
+        <div class="row g-2">
+          <div class="col-12">
+            <label class="form-label">Provider</label>
+            <select id="provider" class="form-select">
+              <option value="openai">OpenAI / Compatible</option>
+              <option value="aipipe" selected>AI Pipe Proxy</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div class="col-12">
+            <label class="form-label">API Base URL</label>
+            <input id="baseUrl" class="form-control" value="https://aipipe.org/openai/v1"/>
+            <div class="form-text">OpenAI‑style /chat/completions endpoint</div>
+          </div>
+          <div class="col-12">
+            <label class="form-label">API Key</label>
+            <input id="apiKey" class="form-control" placeholder="sk‑..." />
+          </div>
+          <div class="col-12">
+            <label class="form-label">Model</label>
+            <input id="model" class="form-control" value="gpt-4o-mini" />
+          </div>
+          <div class="col-12">
+            <label class="form-label">System Prompt (optional)</label>
+            <textarea id="system" class="form-control" rows="2">You are a helpful browser‑based agent. Think step‑by‑step. Use tools when helpful. Keep answers concise.</textarea>
+          </div>
+        </div>
+      </div>
+
+      <div class="card p-3 mb-3">
+        <h2 class="h6">Google Search API</h2>
+        <div class="row g-2">
+          <div class="col-12">
+            <label class="form-label">Google API Key</label>
+            <input id="gKey" class="form-control" placeholder="AIza..." />
+          </div>
+          <div class="col-12">
+            <label class="form-label">Custom Search CX</label>
+            <input id="gCx" class="form-control" placeholder="your_cx_id" />
+            <div class="form-text">Create at customsearch.google.com</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card p-3 mb-3">
+        <h2 class="h6">AI Pipe Tool</h2>
+        <div class="row g-2">
+          <div class="col-12">
+            <div class="form-text">The tool can POST arbitrary JSON to <code>baseUrl + path</code>. Useful for proxying dataflows.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card p-3">
+        <h2 class="h6">Runbook</h2>
+        <ol class="small mb-0">
+          <li>Enter API base & key (AI Pipe works great).</li>
+          <li>Provide Google key+cx for search snippets.</li>
+          <li>Type a prompt. The agent will loop and call tools until done.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-8">
+      <div class="card p-3 mb-3">
+        <div class="d-flex gap-2 align-items-center">
+          <input id="userInput" class="form-control" placeholder="Ask me anything… e.g., ‘Interview me to create a blog post’" />
+          <button id="sendBtn" class="btn btn-primary">Send</button>
+          <button id="resetBtn" class="btn btn-outline-light">Reset</button>
+        </div>
+      </div>
+
+      <div class="card p-3" style="min-height: 50vh;">
+        <div id="log" class="vstack gap-3"></div>
+        <div class="sticky-footer">
+          <small class="text-secondary">Tools available to the model: <code>google_search</code>, <code>ai_pipe_api</code>, <code>run_js</code></small>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- sandboxed iframe for JS exec -->
+<iframe id="sandbox" sandbox="allow-scripts" style="display:none"></iframe>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// --- UI helpers ---
+const el = (sel) => document.querySelector(sel);
+const log = el('#log');
+const alerts = el('#alerts');
+
+function showAlert(msg, type = 'danger') {
+  const id = 'al_'+Math.random().toString(36).slice(2);
+  const div = document.createElement('div');
+  div.className = `alert alert-${type} alert-dismissible fade show`;
+  div.setAttribute('role','alert');
+  div.innerHTML = `${msg.replace(/</g,'&lt;')}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>`;
+  alerts.appendChild(div);
+  return id;
+}
+
+function appendMessage(role, html) {
+  const wrap = document.createElement('div');
+  wrap.className = `p-3 rounded message ${role}`;
+  wrap.innerHTML = `<div class="small text-secondary mb-1">${role.toUpperCase()}</div><div>${html}</div>`;
+  log.appendChild(wrap);
+  wrap.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+// --- Sandbox: run JS safely in an iframe ---
+async function runJsInSandbox(code){
+  return new Promise((resolve) => {
+    const iframe = document.getElementById('sandbox');
+    const blob = new Blob([
+      `<!doctype html><script>\n`+
+      `let logs=[];\n`+
+      `const origLog = console.log; console.log = (...a)=>{logs.push(a.map(x=>typeof x==='object'?JSON.stringify(x):String(x)).join(' ')); origLog(...a)};\n`+
+      `window.addEventListener('message', async (e)=>{\n`+
+      `  try { let result = await (async()=>{ ${code} })();\n`+
+      `    parent.postMessage({type:'sandboxResult', ok:true, logs, result: String(result)}, '*'); }\n`+
+      `  catch(err){ parent.postMessage({type:'sandboxResult', ok:false, logs, error: String(err)}, '*'); }\n`+
+      `});<\/script>`
+    ], {type:'text/html'});
+    const url = URL.createObjectURL(blob);
+    iframe.src = url;
+    const handler = (e)=>{
+      if(e.data && e.data.type==='sandboxResult'){
+        window.removeEventListener('message', handler);
+        URL.revokeObjectURL(url);
+        resolve(e.data);
+      }
+    };
+    window.addEventListener('message', handler);
+    setTimeout(()=>iframe.contentWindow.postMessage({run:true}, '*'), 50);
+  });
+}
+
+// --- Tool executors (called by the agent loop) ---
+async function tool_google_search(args){
+  const { query, num=5 } = args||{};
+  const key = el('#gKey').value.trim();
+  const cx  = el('#gCx').value.trim();
+  if(!key || !cx) throw new Error('Google API key & CX required');
+  const url = new URL('https://www.googleapis.com/customsearch/v1');
+  url.searchParams.set('key', key);
+  url.searchParams.set('cx', cx);
+  url.searchParams.set('q', query);
+  url.searchParams.set('num', Math.min(num, 10));
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('Google CSE error: '+res.status);
+  const data = await res.json();
+  const items = (data.items||[]).map(x=>({title:x.title, link:x.link, snippet:x.snippet}));
+  return {query, items};
+}
+
+async function tool_ai_pipe_api(args){
+  const { path='/chat/completions', body={} } = args||{};
+  const base = el('#baseUrl').value.trim().replace(/\/$/, '');
+  const key  = el('#apiKey').value.trim();
+  const url = base + path;
+  const res = await fetch(url, { method:'POST', headers: { 'Content-Type':'application/json', 'Authorization': key?`Bearer ${key}`:undefined }, body: JSON.stringify(body) });
+  const txt = await res.text();
+  if(!res.ok){ throw new Error(`AI Pipe tool error ${res.status}: ${txt.slice(0,300)}`); }
+  try { return JSON.parse(txt); } catch { return { raw: txt }; }
+}
+
+async function tool_run_js(args){
+  const { code } = args||{};
+  const out = await runJsInSandbox(code||'');
+  if(out.ok){ return { logs: out.logs, result: out.result }; }
+  else { throw new Error('JS Error: '+out.error+ (out.logs?.length? ('\nLogs: '+out.logs.join('\n')):'')); }
+}
+
+const TOOL_EXECUTORS = {
+  google_search: tool_google_search,
+  ai_pipe_api: tool_ai_pipe_api,
+  run_js: tool_run_js,
+};
+
+// --- OpenAI-style tool schema sent to the model ---
+function toolSchema(){
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'google_search',
+        description: 'Search the web and return top snippets for a query',
+        parameters: {
+          type: 'object',
+          properties: { query:{type:'string'}, num:{type:'integer', minimum:1, maximum:10} },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'ai_pipe_api',
+        description: 'POST arbitrary JSON to AI Pipe compatible endpoints (baseUrl + path) and return the JSON/text result',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: {type:'string', description:'/chat/completions or any relative path'},
+            body: {type:'object'}
+          },
+          required: ['path','body']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'run_js',
+        description: 'Securely execute short JavaScript in a sandboxed iframe and return result + console logs',
+        parameters: {
+          type: 'object',
+          properties: { code: {type:'string'} },
+          required: ['code']
+        }
+      }
+    }
+  ];
+}
+
+// --- LLM call ---
+async function callLLM(messages){
+  const base = el('#baseUrl').value.trim().replace(/\/$/, '');
+  const key  = el('#apiKey').value.trim();
+  const model = el('#model').value.trim();
+  const url = base + '/chat/completions';
+  const body = { model, messages, tools: toolSchema(), tool_choice: 'auto', temperature: 0.6 };
+  const res = await fetch(url, { method:'POST', headers: { 'Content-Type':'application/json', 'Authorization': key?`Bearer ${key}`:undefined }, body: JSON.stringify(body) });
+  const json = await res.json().catch(async()=>({error: await res.text()}));
+  if(!res.ok) throw new Error('LLM error '+res.status+': '+JSON.stringify(json));
+  return json;
+}
+
+// --- Agent loop ---
+let MESSAGES = [];
+
+function buildInitialMessages(){
+  const sys = el('#system').value.trim();
+  const msgs = [];
+  if(sys) msgs.push({role:'system', content: sys});
+  return msgs;
+}
+
+async function handleToolCall(tc){
+  const name = tc.function.name;
+  let args = {};
+  try { args = JSON.parse(tc.function.arguments || '{}'); }
+  catch { args = {}; }
+  appendMessage('tool', `<div><div><code>${escapeHtml(name)}</code> args:</div><pre class="smallcode">${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`);
+  try{
+    const result = await TOOL_EXECUTORS[name](args);
+    appendMessage('tool', `<div>✅ <code>${escapeHtml(name)}</code> result:<pre class="smallcode">${escapeHtml(JSON.stringify(result, null, 2)).slice(0,4000)}</pre></div>`);
+    return { role:'tool', tool_call_id: tc.id, name, content: JSON.stringify(result) };
+  }catch(err){
+    const e = String(err);
+    showAlert(e, 'warning');
+    appendMessage('tool', `<div>❌ <code>${escapeHtml(name)}</code> error:<pre class="smallcode">${escapeHtml(e)}</pre></div>`);
+    return { role:'tool', tool_call_id: tc.id, name, content: JSON.stringify({error: e}) };
+  }
+}
+
+async function agentStep(){
+  try{
+    const resp = await callLLM(MESSAGES);
+    const choice = resp.choices?.[0];
+    const msg = choice?.message;
+    const text = msg?.content || '';
+    if(text) appendMessage('agent', `<pre>${escapeHtml(text)}</pre>`);
+
+    const toolCalls = msg?.tool_calls || [];
+    if(toolCalls.length){
+      // execute tools (can be parallel, but keep simple)
+      const toolMsgs = [];
+      for(const tc of toolCalls){ toolMsgs.push(await handleToolCall(tc)); }
+      MESSAGES.push(msg, ...toolMsgs);
+      await agentStep(); // continue the loop until no more tool calls
+    } else {
+      // wait for next user input
+      MESSAGES.push(msg);
+    }
+  } catch(err){
+    showAlert(String(err));
+  }
+}
+
+// --- UI wiring ---
+function resetConversation(){
+  log.innerHTML = '';
+  MESSAGES = buildInitialMessages();
+  appendMessage('agent', '👋 Ready. Tools: <code>google_search</code>, <code>ai_pipe_api</code>, <code>run_js</code>.');
+}
+
+el('#sendBtn').addEventListener('click', async ()=>{
+  const input = el('#userInput');
+  const text = input.value.trim();
+  if(!text) return;
+  input.value = '';
+  appendMessage('user', `<pre>${escapeHtml(text)}</pre>`);
+  MESSAGES.push({role:'user', content: text});
+  await agentStep();
+});
+
+el('#resetBtn').addEventListener('click', resetConversation);
+
+// Enter key handler
+el('#userInput').addEventListener('keydown', (e)=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); el('#sendBtn').click(); }
+});
+
+// boot
+resetConversation();
+</script>
+</body>
+</html>
